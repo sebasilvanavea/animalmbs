@@ -1,0 +1,999 @@
+// ============================================================
+// AnimalMbs Web — Main Application
+// Router, Views, Event Handlers
+// ============================================================
+
+import { auth, pets, vaccines, antiparasitics, medicalRecords, weightEntries, getFullPetData } from './api.js';
+
+// ---- Constants ----
+
+const SPECIES = {
+    Perro: '🐕', Gato: '🐈', Ave: '🐦', Conejo: '🐇',
+    'Hámster': '🐹', Reptil: '🦎', Otro: '🐾'
+};
+const SPECIES_LIST = ['Perro', 'Gato', 'Ave', 'Conejo', 'Hámster', 'Reptil', 'Otro'];
+const SEX_LIST = ['Macho', 'Hembra', 'Desconocido'];
+const AP_TYPES = ['Interno', 'Externo', 'Ambos'];
+
+let currentUser = null;
+let weightChart = null;
+const $app = document.getElementById('app');
+
+// ---- Utilities ----
+
+const esc = (s) => {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+};
+const fmtDate = (d) => d ? new Date(d + 'T00:00:00').toLocaleDateString('es-CL', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+const today = () => new Date().toISOString().split('T')[0];
+const age = (birthDate) => {
+    if (!birthDate) return 'Sin datos';
+    const bd = new Date(birthDate + 'T00:00:00');
+    const now = new Date();
+    const years = now.getFullYear() - bd.getFullYear();
+    const months = now.getMonth() - bd.getMonth() + (years * 12);
+    if (months >= 12) { const y = Math.floor(months / 12); return `${y} año${y === 1 ? '' : 's'}`; }
+    return `${months} mes${months === 1 ? '' : 'es'}`;
+};
+
+function toast(msg) {
+    let t = document.querySelector('.toast');
+    if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t); }
+    t.textContent = msg;
+    t.classList.add('visible');
+    setTimeout(() => t.classList.remove('visible'), 2500);
+}
+
+function navigate(route) { window.location.hash = '#/' + route; }
+
+// ---- Event Delegation ----
+
+$app.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const id = btn.dataset.id;
+
+    if (action === 'logout') { await auth.signOut(); navigate('login'); }
+    if (action === 'delete-pet') { showConfirm('¿Eliminar mascota?', 'Se borrarán todos sus registros.', () => deletePet(id)); }
+    if (action === 'delete-vaccine') { showConfirm('¿Eliminar vacuna?', '', () => deleteRecord('vaccines', id, btn)); }
+    if (action === 'delete-antiparasitic') { showConfirm('¿Eliminar antiparasitario?', '', () => deleteRecord('antiparasitics', id, btn)); }
+    if (action === 'delete-medical') { showConfirm('¿Eliminar registro médico?', '', () => deleteRecord('medical_records', id, btn)); }
+    if (action === 'delete-weight') { showConfirm('¿Eliminar registro?', '', () => deleteRecord('weight_entries', id, btn)); }
+    if (action === 'print') { window.print(); }
+    if (action === 'generate-qr') { generateQR(id); }
+    if (action === 'confirm-yes') { const fn = window._confirmCallback; if (fn) fn(); closeConfirm(); }
+    if (action === 'confirm-no') { closeConfirm(); }
+});
+
+$app.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const action = form.dataset.action;
+    if (!action) return;
+
+    const fd = new FormData(form);
+    const data = Object.fromEntries(fd.entries());
+    const submitBtn = form.querySelector('button[type="submit"]');
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Guardando...'; }
+
+    try {
+        if (action === 'login') { await handleLogin(data); }
+        else if (action === 'register') { await handleRegister(data); }
+        else if (action === 'create-pet') { await handleCreatePet(data); }
+        else if (action === 'edit-pet') { await handleEditPet(data); }
+        else if (action === 'create-vaccine') { await handleCreateVaccine(data); }
+        else if (action === 'create-antiparasitic') { await handleCreateAntiparasitic(data); }
+        else if (action === 'create-medical') { await handleCreateMedical(data); }
+        else if (action === 'create-weight') { await handleCreateWeight(data); }
+    } catch (err) {
+        toast('Error: ' + err.message);
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Guardar'; }
+    }
+});
+
+// ---- Confirm Dialog ----
+
+function showConfirm(title, msg, callback) {
+    window._confirmCallback = callback;
+    const overlay = document.createElement('div');
+    overlay.className = 'dialog-overlay';
+    overlay.id = 'confirm-dialog';
+    overlay.innerHTML = `<div class="dialog-box">
+        <h3>${esc(title)}</h3>
+        ${msg ? `<p>${esc(msg)}</p>` : '<p>Esta acción no se puede deshacer.</p>'}
+        <div class="dialog-actions">
+            <button class="btn btn-outline" data-action="confirm-no">Cancelar</button>
+            <button class="btn btn-danger" data-action="confirm-yes">Eliminar</button>
+        </div>
+    </div>`;
+    $app.appendChild(overlay);
+}
+function closeConfirm() {
+    document.getElementById('confirm-dialog')?.remove();
+    window._confirmCallback = null;
+}
+
+// ---- Form Handlers ----
+
+async function handleLogin({ email, password }) {
+    const { error } = await auth.signIn(email, password);
+    if (error) throw error;
+    navigate('');
+}
+
+async function handleRegister({ email, password, password2 }) {
+    if (password !== password2) throw new Error('Las contraseñas no coinciden');
+    if (password.length < 6) throw new Error('La contraseña debe tener al menos 6 caracteres');
+    const { error } = await auth.signUp(email, password);
+    if (error) throw error;
+    toast('¡Cuenta creada! Revisa tu correo para confirmar.');
+    navigate('login');
+}
+
+async function handleCreatePet(data) {
+    const pet = {
+        name: data.name, species: data.species, breed: data.breed,
+        birth_date: data.birth_date || null, sex: data.sex,
+        color: data.color, weight: parseFloat(data.weight) || 0,
+        microchip_number: data.microchip_number, notes: data.notes,
+    };
+    const created = await pets.create(pet);
+    toast('Mascota agregada');
+    navigate(`pets/${created.id}`);
+}
+
+async function handleEditPet(data) {
+    const updates = {
+        name: data.name, species: data.species, breed: data.breed,
+        birth_date: data.birth_date || null, sex: data.sex,
+        color: data.color, weight: parseFloat(data.weight) || 0,
+        microchip_number: data.microchip_number, notes: data.notes,
+    };
+    await pets.update(data.id, updates);
+    toast('Mascota actualizada');
+    navigate(`pets/${data.id}`);
+}
+
+async function handleCreateVaccine(data) {
+    await vaccines.create({
+        pet_id: data.pet_id, name: data.name, date: data.date,
+        next_dose_date: data.next_dose_date || null,
+        lot_number: data.lot_number, veterinarian: data.veterinarian, notes: data.notes,
+    });
+    toast('Vacuna registrada');
+    navigate(`pets/${data.pet_id}/vaccines`);
+}
+
+async function handleCreateAntiparasitic(data) {
+    await antiparasitics.create({
+        pet_id: data.pet_id, product_name: data.product_name, type: data.type, date: data.date,
+        next_application_date: data.next_application_date || null, notes: data.notes,
+    });
+    toast('Antiparasitario registrado');
+    navigate(`pets/${data.pet_id}/antiparasitics`);
+}
+
+async function handleCreateMedical(data) {
+    await medicalRecords.create({
+        pet_id: data.pet_id, date: data.date, reason: data.reason,
+        diagnosis: data.diagnosis, treatment: data.treatment,
+        veterinarian: data.veterinarian, notes: data.notes,
+    });
+    toast('Registro médico guardado');
+    navigate(`pets/${data.pet_id}/medical`);
+}
+
+async function handleCreateWeight(data) {
+    await weightEntries.create({
+        pet_id: data.pet_id, date: data.date, weight: parseFloat(data.weight),
+        notes: data.notes,
+    });
+    // Also update pet's current weight
+    await pets.update(data.pet_id, { weight: parseFloat(data.weight) });
+    toast('Peso registrado');
+    navigate(`pets/${data.pet_id}/weight`);
+}
+
+async function deletePet(id) {
+    await pets.delete(id);
+    toast('Mascota eliminada');
+    navigate('');
+}
+
+async function deleteRecord(table, id, btn) {
+    const api = { vaccines, antiparasitics, medical_records: medicalRecords, weight_entries: weightEntries };
+    await api[table].delete(id);
+    btn.closest('.record-item')?.remove();
+    toast('Eliminado');
+}
+
+// ---- QR Generation ----
+
+async function generateQR(petId) {
+    const full = await getFullPetData(petId);
+    const qrData = buildQRPayload(full);
+    const url = `${window.location.origin}?d=${qrData}`;
+    const canvas = document.getElementById('qr-canvas');
+    if (canvas) {
+        await window.QRCode.toCanvas(canvas, url, { width: 250, margin: 2 });
+        document.getElementById('qr-url')?.setAttribute('href', url);
+    }
+}
+
+function buildQRPayload(full) {
+    const { pet, vaccines: vacs, antiparasitics: aps, medicalRecords: recs } = full;
+    const data = {
+        app: 'AnimalMbs', v: 1,
+        pet: {
+            name: pet.name, species: pet.species, breed: pet.breed,
+            sex: pet.sex, age: age(pet.birth_date),
+            weight: pet.weight, microchip: pet.microchip_number, color: pet.color,
+        },
+    };
+    if (vacs.length) {
+        data.vac = vacs.slice(0, 5).map(v => {
+            const e = { n: v.name, d: fmtDate(v.date) };
+            if (v.next_dose_date) e.nx = fmtDate(v.next_dose_date);
+            if (v.lot_number) e.l = v.lot_number;
+            return e;
+        });
+    }
+    if (aps.length) {
+        data.ap = aps.slice(0, 3).map(a => {
+            const e = { n: a.product_name, t: a.type, d: fmtDate(a.date) };
+            if (a.next_application_date) e.nx = fmtDate(a.next_application_date);
+            return e;
+        });
+    }
+    if (recs.length) {
+        data.med = recs.slice(0, 3).map(r => {
+            const e = { r: r.reason, d: fmtDate(r.date) };
+            if (r.diagnosis) e.dx = r.diagnosis;
+            if (r.treatment) e.tx = r.treatment;
+            return e;
+        });
+    }
+    data.gen = fmtDate(today());
+    const json = JSON.stringify(data);
+    let b64 = btoa(unescape(encodeURIComponent(json)));
+    b64 = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return b64;
+}
+
+// ---- Router ----
+
+async function handleRoute() {
+    const hash = window.location.hash || '#/';
+    const parts = hash.replace('#/', '').split('/').filter(Boolean);
+
+    // Public ficha from QR
+    const urlP = new URLSearchParams(window.location.search);
+    if (urlP.has('d')) { renderPublicFicha(urlP.get('d')); return; }
+
+    // Auth check
+    if (!currentUser) {
+        if (parts[0] === 'register') { render(registerView()); return; }
+        render(loginView()); return;
+    }
+
+    try {
+        if (parts.length === 0) {
+            const list = await pets.list();
+            render(appShell(petListView(list), 'pets'));
+        } else if (parts[0] === 'pets' && parts[1] === 'new') {
+            render(appShell(petFormView()));
+        } else if (parts[0] === 'pets' && parts.length === 2) {
+            const full = await getFullPetData(parts[1]);
+            render(appShell(petDetailView(full)));
+        } else if (parts[0] === 'pets' && parts[2] === 'edit') {
+            const pet = await pets.get(parts[1]);
+            render(appShell(petFormView(pet)));
+        } else if (parts[0] === 'pets' && parts[2] === 'vaccines' && parts[3] === 'new') {
+            const pet = await pets.get(parts[1]);
+            render(appShell(vaccineFormView(pet)));
+        } else if (parts[0] === 'pets' && parts[2] === 'vaccines') {
+            const [pet, vacs] = await Promise.all([pets.get(parts[1]), vaccines.list(parts[1])]);
+            render(appShell(vaccineListView(pet, vacs)));
+        } else if (parts[0] === 'pets' && parts[2] === 'antiparasitics' && parts[3] === 'new') {
+            const pet = await pets.get(parts[1]);
+            render(appShell(antiparasiticFormView(pet)));
+        } else if (parts[0] === 'pets' && parts[2] === 'antiparasitics') {
+            const [pet, aps] = await Promise.all([pets.get(parts[1]), antiparasitics.list(parts[1])]);
+            render(appShell(antiparasiticListView(pet, aps)));
+        } else if (parts[0] === 'pets' && parts[2] === 'medical' && parts[3] === 'new') {
+            const pet = await pets.get(parts[1]);
+            render(appShell(medicalFormView(pet)));
+        } else if (parts[0] === 'pets' && parts[2] === 'medical') {
+            const [pet, recs] = await Promise.all([pets.get(parts[1]), medicalRecords.list(parts[1])]);
+            render(appShell(medicalListView(pet, recs)));
+        } else if (parts[0] === 'pets' && parts[2] === 'weight') {
+            const [pet, ws] = await Promise.all([pets.get(parts[1]), weightEntries.list(parts[1])]);
+            render(appShell(weightView(pet, ws)));
+            renderWeightChart(ws);
+        } else if (parts[0] === 'pets' && parts[2] === 'qr') {
+            const full = await getFullPetData(parts[1]);
+            render(appShell(qrView(full)));
+            generateQR(parts[1]);
+        } else if (parts[0] === 'settings') {
+            render(appShell(settingsView(), 'settings'));
+        } else {
+            navigate('');
+        }
+    } catch (err) {
+        console.error(err);
+        toast('Error al cargar: ' + err.message);
+    }
+}
+
+function render(html) {
+    $app.innerHTML = html;
+}
+
+// ---- Views ----
+
+function appShell(content, activeTab = '') {
+    return `<div class="app-shell">
+        <div class="top-bar">
+            <div class="logo">🐾 AnimalMbs</div>
+            <div class="user-menu">
+                <span class="text-sm text-secondary">${esc(currentUser?.email?.split('@')[0])}</span>
+                <button class="btn btn-sm btn-outline" data-action="logout">Salir</button>
+            </div>
+        </div>
+        <div class="main-content">${content}</div>
+        <div class="bottom-nav">
+            <a href="#/" class="${activeTab === 'pets' ? 'active' : ''}">
+                <span class="nav-icon">🐾</span> Mascotas
+            </a>
+            <a href="#/settings" class="${activeTab === 'settings' ? 'active' : ''}">
+                <span class="nav-icon">⚙️</span> Ajustes
+            </a>
+        </div>
+    </div>`;
+}
+
+function loginView() {
+    return `<div class="auth-container">
+        <div class="auth-box">
+            <div class="auth-logo">
+                <div class="emoji">🐾</div>
+                <h1>AnimalMbs</h1>
+                <p>Gestión veterinaria digital</p>
+            </div>
+            <div class="auth-error" id="auth-error"></div>
+            <form data-action="login">
+                <div class="form-group">
+                    <label class="form-label">Correo electrónico</label>
+                    <input type="email" name="email" class="form-input" required autocomplete="email" placeholder="tu@correo.com">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Contraseña</label>
+                    <input type="password" name="password" class="form-input" required autocomplete="current-password" placeholder="••••••••">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Iniciar Sesión</button>
+            </form>
+            <div class="auth-footer">
+                ¿No tienes cuenta? <a href="#/register">Crear cuenta</a>
+            </div>
+        </div>
+    </div>`;
+}
+
+function registerView() {
+    return `<div class="auth-container">
+        <div class="auth-box">
+            <div class="auth-logo">
+                <div class="emoji">🐾</div>
+                <h1>Crear Cuenta</h1>
+                <p>Únete a AnimalMbs</p>
+            </div>
+            <div class="auth-error" id="auth-error"></div>
+            <form data-action="register">
+                <div class="form-group">
+                    <label class="form-label">Correo electrónico</label>
+                    <input type="email" name="email" class="form-input" required placeholder="tu@correo.com">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Contraseña</label>
+                    <input type="password" name="password" class="form-input" required minlength="6" placeholder="Mínimo 6 caracteres">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Confirmar contraseña</label>
+                    <input type="password" name="password2" class="form-input" required minlength="6" placeholder="Repite tu contraseña">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Crear Cuenta</button>
+            </form>
+            <div class="auth-footer">
+                ¿Ya tienes cuenta? <a href="#/login">Iniciar sesión</a>
+            </div>
+        </div>
+    </div>`;
+}
+
+function petListView(list) {
+    return `<div class="page-header">
+            <h1>Mis Mascotas</h1>
+        </div>
+        <div class="pet-grid">
+            ${list.map(p => `
+                <a href="#/pets/${p.id}" class="pet-card">
+                    <div class="emoji">${SPECIES[p.species] || '🐾'}</div>
+                    <div class="pet-name">${esc(p.name)}</div>
+                    <div class="pet-info">${esc(p.species)}${p.breed ? ' · ' + esc(p.breed) : ''}</div>
+                    ${p.weight > 0 ? `<div class="pet-weight">${p.weight} kg</div>` : ''}
+                </a>
+            `).join('')}
+            <a href="#/pets/new" class="add-pet-card">
+                <span class="plus">+</span>
+                <span>Agregar Mascota</span>
+            </a>
+        </div>`;
+}
+
+function petDetailView({ pet, vaccines: vacs, antiparasitics: aps, medicalRecords: recs, weights }) {
+    const emoji = SPECIES[pet.species] || '🐾';
+    const nextVac = vacs.find(v => v.next_dose_date && new Date(v.next_dose_date) > new Date());
+    const nextAp = aps.find(a => a.next_application_date && new Date(a.next_application_date) > new Date());
+
+    return `<div class="page-header">
+            <a href="#/" class="back-btn">← Mascotas</a>
+        </div>
+        <div class="pet-hero">
+            <div class="emoji">${emoji}</div>
+            <h2>${esc(pet.name)}</h2>
+            <div class="subtitle">${esc(pet.species)}${pet.breed ? ' · ' + esc(pet.breed) : ''}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Información</div>
+            <div class="info-grid">
+                <div class="info-item"><span class="info-label">Sexo</span><span class="info-value">${esc(pet.sex)}</span></div>
+                <div class="info-item"><span class="info-label">Edad</span><span class="info-value">${age(pet.birth_date)}</span></div>
+                <div class="info-item"><span class="info-label">Peso</span><span class="info-value">${pet.weight > 0 ? pet.weight + ' kg' : 'N/R'}</span></div>
+                <div class="info-item"><span class="info-label">Color</span><span class="info-value">${esc(pet.color) || 'N/E'}</span></div>
+                ${pet.microchip_number ? `<div class="info-item info-full"><span class="info-label">Microchip</span><span class="info-value">${esc(pet.microchip_number)}</span></div>` : ''}
+            </div>
+        </div>
+
+        <div class="quick-actions">
+            <a href="#/pets/${pet.id}/vaccines" class="quick-action qa-green">
+                <span class="qa-icon">💉</span>Vacunas
+                <span class="badge badge-green">${vacs.length}</span>
+            </a>
+            <a href="#/pets/${pet.id}/antiparasitics" class="quick-action qa-orange">
+                <span class="qa-icon">🛡️</span>Antipar.
+                <span class="badge badge-orange">${aps.length}</span>
+            </a>
+            <a href="#/pets/${pet.id}/medical" class="quick-action qa-purple">
+                <span class="qa-icon">📋</span>Historial
+                <span class="badge badge-purple">${recs.length}</span>
+            </a>
+            <a href="#/pets/${pet.id}/weight" class="quick-action qa-blue">
+                <span class="qa-icon">⚖️</span>Peso
+                <span class="badge badge-blue">${weights.length}</span>
+            </a>
+            <a href="#/pets/${pet.id}/qr" class="quick-action qa-green">
+                <span class="qa-icon">📱</span>QR
+            </a>
+            <a href="#/pets/${pet.id}/edit" class="quick-action qa-pink">
+                <span class="qa-icon">✏️</span>Editar
+            </a>
+        </div>
+
+        ${nextVac ? `<div class="card"><div class="flex-between">
+            <span>📅 Próxima vacuna: <strong>${esc(nextVac.name)}</strong></span>
+            <span class="badge badge-green">${fmtDate(nextVac.next_dose_date)}</span>
+        </div></div>` : ''}
+        ${nextAp ? `<div class="card"><div class="flex-between">
+            <span>📅 Próximo antiparasitario: <strong>${esc(nextAp.product_name)}</strong></span>
+            <span class="badge badge-orange">${fmtDate(nextAp.next_application_date)}</span>
+        </div></div>` : ''}
+
+        ${pet.notes ? `<div class="card"><div class="card-title">Notas</div><p class="text-secondary">${esc(pet.notes)}</p></div>` : ''}
+
+        <button class="btn btn-danger btn-block mt-3" data-action="delete-pet" data-id="${pet.id}">
+            Eliminar Mascota
+        </button>`;
+}
+
+function petFormView(pet = null) {
+    const isEdit = !!pet;
+    return `<div class="page-header">
+            <a href="#/${isEdit ? 'pets/' + pet.id : ''}" class="back-btn">← ${isEdit ? pet.name : 'Mascotas'}</a>
+            <h1>${isEdit ? 'Editar Mascota' : 'Nueva Mascota'}</h1>
+        </div>
+        <div class="card">
+            <form data-action="${isEdit ? 'edit-pet' : 'create-pet'}">
+                ${isEdit ? `<input type="hidden" name="id" value="${pet.id}">` : ''}
+                <div class="form-group">
+                    <label class="form-label">Nombre *</label>
+                    <input type="text" name="name" class="form-input" required value="${esc(pet?.name || '')}">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Especie</label>
+                        <select name="species" class="form-select">
+                            ${SPECIES_LIST.map(s => `<option value="${s}" ${pet?.species === s ? 'selected' : ''}>${SPECIES[s]} ${s}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Sexo</label>
+                        <select name="sex" class="form-select">
+                            ${SEX_LIST.map(s => `<option value="${s}" ${pet?.sex === s ? 'selected' : ''}>${s}</option>`).join('')}
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Raza</label>
+                    <input type="text" name="breed" class="form-input" value="${esc(pet?.breed || '')}">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Fecha de nacimiento</label>
+                        <input type="date" name="birth_date" class="form-input" value="${pet?.birth_date || ''}">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Peso (kg)</label>
+                        <input type="number" name="weight" class="form-input" step="0.1" min="0" value="${pet?.weight || ''}">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Color</label>
+                        <input type="text" name="color" class="form-input" value="${esc(pet?.color || '')}">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Microchip</label>
+                        <input type="text" name="microchip_number" class="form-input" value="${esc(pet?.microchip_number || '')}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Notas</label>
+                    <textarea name="notes" class="form-textarea">${esc(pet?.notes || '')}</textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">${isEdit ? 'Guardar Cambios' : 'Agregar Mascota'}</button>
+            </form>
+        </div>`;
+}
+
+// ---- Vaccine Views ----
+
+function vaccineListView(pet, vacs) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}" class="back-btn">← ${esc(pet.name)}</a>
+            <h1>💉 Vacunas</h1>
+        </div>
+        <a href="#/pets/${pet.id}/vaccines/new" class="btn btn-primary btn-block mb-2">+ Agregar Vacuna</a>
+        ${vacs.length === 0 ? emptyState('💉', 'Sin vacunas registradas', 'Agrega la primera vacuna de ' + pet.name) : ''}
+        ${vacs.length > 0 ? `<div class="card">${vacs.map(v => `
+            <div class="record-item">
+                <div class="record-header">
+                    <span class="record-name">${esc(v.name)}</span>
+                    <span class="record-date">${fmtDate(v.date)}</span>
+                </div>
+                ${v.lot_number ? `<div class="record-detail">Lote: ${esc(v.lot_number)}</div>` : ''}
+                ${v.veterinarian ? `<div class="record-detail">Vet: ${esc(v.veterinarian)}</div>` : ''}
+                ${v.next_dose_date ? `<div class="record-next">📅 Próxima dosis: ${fmtDate(v.next_dose_date)}</div>` : ''}
+                <div class="record-actions">
+                    <button class="btn btn-sm btn-danger" data-action="delete-vaccine" data-id="${v.id}">Eliminar</button>
+                </div>
+            </div>
+        `).join('')}</div>` : ''}`;
+}
+
+function vaccineFormView(pet) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}/vaccines" class="back-btn">← Vacunas</a>
+            <h1>Nueva Vacuna</h1>
+        </div>
+        <div class="card">
+            <form data-action="create-vaccine">
+                <input type="hidden" name="pet_id" value="${pet.id}">
+                <div class="form-group">
+                    <label class="form-label">Nombre de la vacuna *</label>
+                    <input type="text" name="name" class="form-input" required placeholder="Ej: Rabia, Parvovirus">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Fecha *</label>
+                        <input type="date" name="date" class="form-input" required value="${today()}">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Próxima dosis</label>
+                        <input type="date" name="next_dose_date" class="form-input">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Nº de lote</label>
+                        <input type="text" name="lot_number" class="form-input">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Veterinario</label>
+                        <input type="text" name="veterinarian" class="form-input">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Notas</label>
+                    <textarea name="notes" class="form-textarea"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Guardar Vacuna</button>
+            </form>
+        </div>`;
+}
+
+// ---- Antiparasitic Views ----
+
+function antiparasiticListView(pet, aps) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}" class="back-btn">← ${esc(pet.name)}</a>
+            <h1>🛡️ Antiparasitarios</h1>
+        </div>
+        <a href="#/pets/${pet.id}/antiparasitics/new" class="btn btn-primary btn-block mb-2">+ Agregar Antiparasitario</a>
+        ${aps.length === 0 ? emptyState('🛡️', 'Sin antiparasitarios', 'Registra el primer antiparasitario') : ''}
+        ${aps.length > 0 ? `<div class="card">${aps.map(a => `
+            <div class="record-item">
+                <div class="record-header">
+                    <span class="record-name">${esc(a.product_name)}</span>
+                    <span class="record-date">${fmtDate(a.date)}</span>
+                </div>
+                <div class="record-detail"><span class="badge badge-orange">${esc(a.type)}</span></div>
+                ${a.next_application_date ? `<div class="record-next">📅 Próxima aplicación: ${fmtDate(a.next_application_date)}</div>` : ''}
+                <div class="record-actions">
+                    <button class="btn btn-sm btn-danger" data-action="delete-antiparasitic" data-id="${a.id}">Eliminar</button>
+                </div>
+            </div>
+        `).join('')}</div>` : ''}`;
+}
+
+function antiparasiticFormView(pet) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}/antiparasitics" class="back-btn">← Antiparasitarios</a>
+            <h1>Nuevo Antiparasitario</h1>
+        </div>
+        <div class="card">
+            <form data-action="create-antiparasitic">
+                <input type="hidden" name="pet_id" value="${pet.id}">
+                <div class="form-group">
+                    <label class="form-label">Producto *</label>
+                    <input type="text" name="product_name" class="form-input" required placeholder="Ej: Frontline Plus">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Tipo</label>
+                        <select name="type" class="form-select">
+                            ${AP_TYPES.map(t => `<option value="${t}">${t}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Fecha *</label>
+                        <input type="date" name="date" class="form-input" required value="${today()}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Próxima aplicación</label>
+                    <input type="date" name="next_application_date" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Notas</label>
+                    <textarea name="notes" class="form-textarea"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Guardar</button>
+            </form>
+        </div>`;
+}
+
+// ---- Medical Record Views ----
+
+function medicalListView(pet, recs) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}" class="back-btn">← ${esc(pet.name)}</a>
+            <h1>📋 Historial Médico</h1>
+        </div>
+        <a href="#/pets/${pet.id}/medical/new" class="btn btn-primary btn-block mb-2">+ Nuevo Registro</a>
+        ${recs.length === 0 ? emptyState('📋', 'Sin registros médicos', 'Agrega el primer registro médico') : ''}
+        ${recs.length > 0 ? `<div class="card">${recs.map(r => `
+            <div class="record-item">
+                <div class="record-header">
+                    <span class="record-name">${esc(r.reason)}</span>
+                    <span class="record-date">${fmtDate(r.date)}</span>
+                </div>
+                ${r.diagnosis ? `<div class="record-detail"><strong>Diagnóstico:</strong> ${esc(r.diagnosis)}</div>` : ''}
+                ${r.treatment ? `<div class="record-detail"><strong>Tratamiento:</strong> ${esc(r.treatment)}</div>` : ''}
+                ${r.veterinarian ? `<div class="record-detail">Vet: ${esc(r.veterinarian)}</div>` : ''}
+                <div class="record-actions">
+                    <button class="btn btn-sm btn-danger" data-action="delete-medical" data-id="${r.id}">Eliminar</button>
+                </div>
+            </div>
+        `).join('')}</div>` : ''}`;
+}
+
+function medicalFormView(pet) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}/medical" class="back-btn">← Historial</a>
+            <h1>Nuevo Registro Médico</h1>
+        </div>
+        <div class="card">
+            <form data-action="create-medical">
+                <input type="hidden" name="pet_id" value="${pet.id}">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Motivo *</label>
+                        <input type="text" name="reason" class="form-input" required placeholder="Ej: Control anual">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Fecha *</label>
+                        <input type="date" name="date" class="form-input" required value="${today()}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Diagnóstico</label>
+                    <textarea name="diagnosis" class="form-textarea" placeholder="Diagnóstico del veterinario"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Tratamiento</label>
+                    <textarea name="treatment" class="form-textarea" placeholder="Tratamiento indicado"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Veterinario</label>
+                    <input type="text" name="veterinarian" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Notas</label>
+                    <textarea name="notes" class="form-textarea"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Guardar Registro</button>
+            </form>
+        </div>`;
+}
+
+// ---- Weight Views ----
+
+function weightView(pet, weights) {
+    const sorted = [...weights].sort((a, b) => new Date(a.date) - new Date(b.date));
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}" class="back-btn">← ${esc(pet.name)}</a>
+            <h1>⚖️ Control de Peso</h1>
+        </div>
+        <div class="card">
+            <div class="card-title">Evolución</div>
+            <div class="chart-container">
+                <canvas id="weight-chart"></canvas>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">Registrar Peso</div>
+            <form data-action="create-weight">
+                <input type="hidden" name="pet_id" value="${pet.id}">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Peso (kg) *</label>
+                        <input type="number" name="weight" class="form-input" step="0.1" min="0" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Fecha *</label>
+                        <input type="date" name="date" class="form-input" required value="${today()}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Notas</label>
+                    <input type="text" name="notes" class="form-input" placeholder="Opcional">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Registrar</button>
+            </form>
+        </div>
+        ${sorted.length > 0 ? `<div class="card">
+            <div class="card-title">Historial</div>
+            ${sorted.reverse().map(w => `
+                <div class="record-item">
+                    <div class="record-header">
+                        <span class="record-name">${w.weight} kg</span>
+                        <span class="record-date">${fmtDate(w.date)}</span>
+                    </div>
+                    ${w.notes ? `<div class="record-detail">${esc(w.notes)}</div>` : ''}
+                    <div class="record-actions">
+                        <button class="btn btn-sm btn-danger" data-action="delete-weight" data-id="${w.id}">Eliminar</button>
+                    </div>
+                </div>
+            `).join('')}
+        </div>` : ''}`;
+}
+
+function renderWeightChart(weights) {
+    const sorted = [...weights].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const canvas = document.getElementById('weight-chart');
+    if (!canvas || sorted.length === 0) return;
+
+    if (weightChart) weightChart.destroy();
+    weightChart = new Chart(canvas, {
+        type: 'line',
+        data: {
+            labels: sorted.map(w => fmtDate(w.date)),
+            datasets: [{
+                label: 'Peso (kg)',
+                data: sorted.map(w => w.weight),
+                borderColor: '#5cb8a2',
+                backgroundColor: 'rgba(92,184,162,0.1)',
+                fill: true, tension: 0.3, pointRadius: 5,
+                pointBackgroundColor: '#5cb8a2',
+            }]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+                y: { beginAtZero: false, grid: { color: 'rgba(0,0,0,0.05)' } },
+                x: { grid: { display: false } }
+            }
+        }
+    });
+}
+
+// ---- QR View ----
+
+function qrView({ pet }) {
+    return `<div class="page-header">
+            <a href="#/pets/${pet.id}" class="back-btn">← ${esc(pet.name)}</a>
+            <h1>📱 Código QR</h1>
+        </div>
+        <div class="card">
+            <div class="qr-container">
+                <canvas id="qr-canvas"></canvas>
+                <div class="qr-info">
+                    <p><strong>Escanea para ver la ficha clínica</strong></p>
+                    <p class="text-sm mt-1">Funciona en Web, iOS y Android</p>
+                </div>
+                <a id="qr-url" href="#" target="_blank" class="btn btn-secondary btn-block mt-2">Abrir enlace</a>
+                <button class="btn btn-outline btn-block" data-action="print">🖨️ Imprimir</button>
+            </div>
+        </div>`;
+}
+
+// ---- Settings View ----
+
+function settingsView() {
+    return `<div class="page-header"><h1>⚙️ Ajustes</h1></div>
+        <div class="card">
+            <div class="card-title">Cuenta</div>
+            <div class="info-item mb-2">
+                <span class="info-label">Correo</span>
+                <span class="info-value">${esc(currentUser?.email)}</span>
+            </div>
+            <button class="btn btn-danger btn-block" data-action="logout">Cerrar Sesión</button>
+        </div>
+        <div class="card">
+            <div class="card-title">Acerca de</div>
+            <p class="text-secondary text-sm">AnimalMbs v1.0.0</p>
+            <p class="text-secondary text-sm mt-1">Gestión veterinaria digital. Todos los datos se almacenan de forma segura en la nube.</p>
+            <p class="text-secondary text-sm mt-1">🐾 Hecho con amor para tu mascota</p>
+        </div>`;
+}
+
+// ---- Empty State ----
+
+function emptyState(emoji, title, subtitle) {
+    return `<div class="empty-state">
+        <div class="emoji">${emoji}</div>
+        <h3>${title}</h3>
+        <p>${subtitle}</p>
+    </div>`;
+}
+
+// ---- Public Ficha (from QR ?d= parameter) ----
+
+function renderPublicFicha(encoded) {
+    try {
+        let b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const json = decodeURIComponent(escape(atob(b64)));
+        const data = JSON.parse(json);
+        if (!data.pet) throw new Error('Invalid data');
+        render(publicFichaView(data));
+    } catch (e) {
+        render(emptyState('🐾', 'AnimalMbs', 'El enlace no es válido o ha expirado.'));
+    }
+}
+
+function publicFichaView(data) {
+    const pet = data.pet;
+    const emoji = SPECIES[pet.species] || '🐾';
+    const apTypes = { Interno: 'Interno', Externo: 'Externo', Ambos: 'Ambos' };
+
+    let html = `<div class="ficha-header">
+            <div class="logo">🐾 ANIMALMBS</div>
+            <div class="ficha-avatar">${emoji}</div>
+            <h1>${esc(pet.name)}</h1>
+            <div class="subtitle">Ficha Clínica Veterinaria</div>
+        </div>
+        <div class="ficha-container">
+            <div class="card">
+                <div class="card-title">Datos del Paciente</div>
+                <div class="info-grid">
+                    <div class="info-item"><span class="info-label">Especie</span><span class="info-value">${emoji} ${esc(pet.species)}</span></div>
+                    <div class="info-item"><span class="info-label">Raza</span><span class="info-value">${esc(pet.breed) || 'N/E'}</span></div>
+                    <div class="info-item"><span class="info-label">Sexo</span><span class="info-value">${esc(pet.sex)}</span></div>
+                    <div class="info-item"><span class="info-label">Edad</span><span class="info-value">${esc(pet.age) || 'N/E'}</span></div>
+                    <div class="info-item"><span class="info-label">Peso</span><span class="info-value">${pet.weight > 0 ? pet.weight + ' kg' : 'N/R'}</span></div>
+                    <div class="info-item"><span class="info-label">Color</span><span class="info-value">${esc(pet.color) || 'N/E'}</span></div>
+                    ${pet.microchip ? `<div class="info-item info-full"><span class="info-label">Microchip</span><span class="info-value">${esc(pet.microchip)}</span></div>` : ''}
+                </div>
+            </div>`;
+
+    if (data.vac?.length) {
+        html += `<div class="card"><div class="card-title">Vacunas</div>`;
+        for (const v of data.vac) {
+            html += `<div class="record-item">
+                <div class="record-header"><span class="record-name"><span class="badge badge-green">💉</span> ${esc(v.n)}</span><span class="record-date">${esc(v.d)}</span></div>
+                ${v.l ? `<div class="record-detail">Lote: ${esc(v.l)}</div>` : ''}
+                ${v.nx ? `<div class="record-next">📅 Próxima dosis: ${esc(v.nx)}</div>` : ''}
+            </div>`;
+        }
+        html += `</div>`;
+    }
+
+    if (data.ap?.length) {
+        html += `<div class="card"><div class="card-title">Antiparasitarios</div>`;
+        for (const a of data.ap) {
+            html += `<div class="record-item">
+                <div class="record-header"><span class="record-name"><span class="badge badge-orange">🛡️</span> ${esc(a.n)}</span><span class="record-date">${esc(a.d)}</span></div>
+                <div class="record-detail">Tipo: ${esc(apTypes[a.t] || a.t)}</div>
+                ${a.nx ? `<div class="record-next">📅 Próxima aplicación: ${esc(a.nx)}</div>` : ''}
+            </div>`;
+        }
+        html += `</div>`;
+    }
+
+    if (data.med?.length) {
+        html += `<div class="card"><div class="card-title">Historial Médico</div>`;
+        for (const r of data.med) {
+            html += `<div class="record-item">
+                <div class="record-header"><span class="record-name"><span class="badge badge-purple">📋</span> ${esc(r.r)}</span><span class="record-date">${esc(r.d)}</span></div>
+                ${r.dx ? `<div class="record-detail"><strong>Diagnóstico:</strong> ${esc(r.dx)}</div>` : ''}
+                ${r.tx ? `<div class="record-detail"><strong>Tratamiento:</strong> ${esc(r.tx)}</div>` : ''}
+            </div>`;
+        }
+        html += `</div>`;
+    }
+
+    html += `<div class="card" style="padding:1rem;">
+            <button class="btn btn-primary btn-block" data-action="print">🖨️ Imprimir / Guardar PDF</button>
+        </div>
+    </div>
+    <div class="ficha-footer">
+        <p>Generado el ${esc(data.gen || '')} por <strong>AnimalMbs</strong></p>
+        <p style="margin-top:0.25rem;">Ficha clínica veterinaria digital</p>
+    </div>`;
+
+    return html;
+}
+
+// ---- Init ----
+
+async function init() {
+    // Check for public ficha URL
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has('d')) {
+        renderPublicFicha(urlParams.get('d'));
+        return;
+    }
+
+    // Check auth state
+    const { data: { session } } = await auth.getSession();
+    if (session) {
+        currentUser = session.user;
+    }
+
+    auth.onAuthChange((_event, session) => {
+        currentUser = session?.user || null;
+        handleRoute();
+    });
+
+    window.addEventListener('hashchange', handleRoute);
+    handleRoute();
+}
+
+init();
